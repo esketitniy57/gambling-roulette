@@ -12,10 +12,13 @@ model User {
   steamId        String   @unique
   username       String
   avatar         String
-  balance        Float    @default(0)
+  balance        Float    @default(500)
   usedDimasPromo Boolean  @default(false)
   bets           Bet[]
   createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([steamId])
 }
 
 model Round {
@@ -25,9 +28,12 @@ model Round {
   clientSeed     String
   nonce          Int
   winningColor   String
-  status         String   @default("betting")
+  winningNumber  Int
+  status         String   @default("finished")
   bets           Bet[]
   createdAt      DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model Bet {
@@ -39,4 +45,7 @@ model Bet {
   color     String
   amount    Float
   createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([roundId])
 }
