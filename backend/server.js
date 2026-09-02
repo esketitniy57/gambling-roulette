@@ -5,6 +5,7 @@ const cors = require('cors');
 const session = require('express-session');
 const passport = require('passport');
 const SteamStrategy = require('passport-steam').Strategy;
+const { PrismaClient } = require('@prisma/client');
 const engine = require('./engine');
 
 const app = express();
@@ -12,6 +13,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
+
+const prisma = new PrismaClient();
 
 app.use(cors());
 app.use(express.json());
@@ -32,13 +35,29 @@ passport.use(new SteamStrategy({
   returnURL: (process.env.SITE_URL || 'http://localhost:3000') + '/auth/steam/return',
   realm: (process.env.SITE_URL || 'http://localhost:3000') + '/',
   apiKey: process.env.STEAM_API_KEY || 'your_steam_api_key'
-}, (identifier, profile, done) => {
-  const user = {
-    steamId: profile.id,
-    username: profile.displayName,
-    avatar: profile.photos && profile.photos[2] ? profile.photos[2].value : ''
-  };
-  return done(null, user);
+}, async (identifier, profile, done) => {
+  try {
+    let user = await prisma.user.findUnique({
+      where: { steamId: profile.id }
+    });
+
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          steamId: profile.id,
+          username: profile.displayName,
+          avatar: profile.photos && profile.photos[2] ? profile.photos[2].value : '',
+          balance: 500,
+          usedDimasPromo: false
+        }
+      });
+    }
+
+    return done(null, user);
+  } catch (err) {
+    console.error('Steam auth error:', err);
+    return done(err);
+  }
 }));
 
 app.get('/auth/steam', passport.authenticate('steam'));
@@ -55,26 +74,12 @@ let bets = { red: [], black: [], green: [] };
 let roundStatus = 'betting';
 let history = [];
 
-// Хранилище пользователей
 const socketUsers = new Map();
-const allUsers = new Map();
-
-function getOrCreateUser(steamId, username, avatar) {
-  if (!allUsers.has(steamId)) {
-    allUsers.set(steamId, {
-      steamId,
-      username,
-      avatar,
-      balance: 500,
-      usedDimasPromo: false
-    });
-  }
-  return allUsers.get(steamId);
-}
 
 io.on('connection', (socket) => {
   console.log('Подключился: ' + socket.id);
 
+  // Отправляем начальное состояние
   socket.emit('init', {
     roundId: currentRoundId,
     hash: engine.serverSeedHash,
@@ -83,54 +88,125 @@ io.on('connection', (socket) => {
     history: history
   });
 
-  socket.on('login', (data) => {
-    const user = getOrCreateUser(data.steamId, data.username, data.avatar);
-    socketUsers.set(socket.id, user);
-    socket.emit('user_data', { ...user });
-    console.log('Вход пользователя: ' + user.username);
+  socket.on('login', async (data) => {
+    try {
+      let user = await prisma.user.findUnique({
+        where: { steamId: data.steamId }
+      });
+
+      if (!user) {
+        user = await prisma.user.create({
+          data: {
+            steamId: data.steamId,
+            username: data.username,
+            avatar: data.avatar,
+            balance: 500,
+            usedDimasPromo: false
+          }
+        });
+      }
+
+      socketUsers.set(socket.id, user);
+      socket.emit('user_data', user);
+      console.log('Вход: ' + user.username);
+    } catch (err) {
+      console.error('Login error:', err);
+    }
   });
 
-  socket.on('place_bet', (data) => {
+  socket.on('place_bet', async (data) => {
     const user = socketUsers.get(socket.id);
-    if (!user) return socket.emit('error_msg', 'Сначала войди через Steam');
+    if (!user) return socket.emit('error_msg', 'Сначала войди');
     if (roundStatus !== 'betting') return socket.emit('error_msg', 'Ставки закрыты');
 
     const { color, amount } = data;
     if (!['red', 'black', 'green'].includes(color)) return;
-    if (amount <= 0) return socket.emit('error_msg', 'Неверная сумма');
-    if (amount > user.balance) return socket.emit('error_msg', 'Недостаточно средств');
+    if (amount <= 0 || amount > user.balance) {
+      return socket.emit('error_msg', 'Недостаточно средств');
+    }
 
-    user.balance -= amount;
-    bets[color].push({
-      userId: user.steamId,
-      username: user.username,
-      avatar: user.avatar,
-      amount: amount
-    });
+    try {
+      // Транзакция: списываем баланс и создаём ставку
+      const updatedUser = await prisma.$transaction(async (tx) => {
+        const userDb = await tx.user.findUnique({
+          where: { id: user.id },
+        });
 
-    socket.emit('user_data', { ...user });
-    io.emit('new_bet', { color: color, bets: bets });
-    console.log('Ставка: ' + user.username + ' поставил ' + amount + ' на ' + color);
+        if (userDb.balance < amount) {
+          throw new Error('Недостаточно средств');
+        }
+
+        await tx.user.update({
+          where: { id: user.id },
+          data: { balance: { decrement: amount } }
+        });
+
+        await tx.bet.create({
+          data: {
+            userId: user.id,
+            roundId: currentRoundId,
+            color: color,
+            amount: amount
+          }
+        });
+
+        return await tx.user.findUnique({ where: { id: user.id } });
+      });
+
+      // Обновляем в памяти и сокете
+      user.balance = updatedUser.balance;
+      socketUsers.set(socket.id, user);
+
+      bets[color].push({
+        userId: user.id,
+        username: user.username,
+        avatar: user.avatar,
+        amount: amount
+      });
+
+      socket.emit('user_data', user);
+      io.emit('new_bet', { color: color, bets: bets });
+      console.log(`Ставка: ${user.username} поставил ${amount} на ${color}`);
+    } catch (err) {
+      console.error('Bet error:', err);
+      socket.emit('error_msg', 'Ошибка ставки: ' + err.message);
+    }
   });
 
-  socket.on('activate_promo', (data) => {
+  socket.on('activate_promo', async (data) => {
     const user = socketUsers.get(socket.id);
-    if (!user) return socket.emit('error_msg', 'Сначала войди через Steam');
-
-    console.log('Промокод от ' + user.username + ': ' + data.code);
+    if (!user) return socket.emit('error_msg', 'Сначала войди');
 
     if (data.code.toLowerCase() !== 'dimas') {
       return socket.emit('promo_error', 'Неверный промокод');
     }
-    if (user.usedDimasPromo) {
-      return socket.emit('promo_error', 'Промокод уже использован');
-    }
 
-    user.balance += 1000;
-    user.usedDimasPromo = true;
-    socket.emit('promo_success', { newBalance: user.balance });
-    socket.emit('user_data', { ...user });
-    console.log('Промокод активирован: ' + user.username);
+    try {
+      const updatedUser = await prisma.user.update({
+        where: { 
+          id: user.id,
+          usedDimasPromo: false 
+        },
+        data: { 
+          balance: { increment: 1000 },
+          usedDimasPromo: true 
+        }
+      });
+
+      user.balance = updatedUser.balance;
+      user.usedDimasPromo = true;
+      socketUsers.set(socket.id, user);
+
+      socket.emit('promo_success', { newBalance: updatedUser.balance });
+      socket.emit('user_data', user);
+      console.log('Промокод активирован: ' + user.username);
+    } catch (err) {
+      if (err.code === 'P2025') {
+        socket.emit('promo_error', 'Промокод уже использован');
+      } else {
+        socket.emit('promo_error', 'Ошибка: ' + err.message);
+      }
+    }
   });
 
   socket.on('disconnect', () => {
@@ -138,7 +214,7 @@ io.on('connection', (socket) => {
   });
 });
 
-function startRound() {
+async function startRound() {
   console.log('=== Начало раунда #' + currentRoundId + ' ===');
   
   bets = { red: [], black: [], green: [] };
@@ -149,7 +225,7 @@ function startRound() {
     hash: engine.serverSeedHash
   });
 
-  setTimeout(() => {
+  setTimeout(async () => {
     console.log('Крутим рулетку...');
     roundStatus = 'spinning';
     io.emit('spinning');
@@ -157,26 +233,54 @@ function startRound() {
     const clientSeed = Math.random().toString(36).substring(2);
     const result = engine.getRoundResult(engine.serverSeed, clientSeed, currentRoundId);
 
-    console.log('Выпало: ' + result.color + ' (число ' + result.roll + ')');
+    console.log(`Выпало: ${result.color} (число ${result.roll})`);
+
+    // Создаём раунд в БД
+    await prisma.round.create({
+      data: {
+        serverSeedHash: engine.serverSeedHash,
+        serverSeed: engine.serverSeed,
+        clientSeed: clientSeed,
+        nonce: currentRoundId,
+        winningColor: result.color,
+        winningNumber: result.roll,
+        status: 'finished'
+      }
+    });
 
     const multipliers = { red: 2, black: 2, green: 14 };
     const winMultiplier = multipliers[result.color];
 
-    const winners = bets[result.color] || [];
-    for (const bet of winners) {
-      const user = allUsers.get(bet.userId);
-      if (user) {
-        user.balance += bet.amount * winMultiplier;
-        console.log('Выплата: ' + user.username + ' получил ' + (bet.amount * winMultiplier));
+    // Выплачиваем выигрыши
+    const winningBets = await prisma.bet.findMany({
+      where: {
+        roundId: currentRoundId,
+        color: result.color
+      },
+      include: {
+        user: true
       }
+    });
+
+    for (const bet of winningBets) {
+      await prisma.user.update({
+        where: { id: bet.userId },
+        data: { balance: { increment: bet.amount * winMultiplier } }
+      });
+      console.log(`Выплата: ${bet.user.username} получил ${bet.amount * winMultiplier}`);
     }
 
-    history.unshift({
-      roundId: currentRoundId,
-      color: result.color,
-      roll: result.roll
+    // Получаем историю последних 20 раундов
+    const historyRounds = await prisma.round.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20
     });
-    if (history.length > 20) history.pop();
+
+    history = historyRounds.map(r => ({
+      roundId: r.id,
+      color: r.winningColor,
+      roll: r.winningNumber
+    }));
 
     io.emit('round_end', {
       winningColor: result.color,
@@ -185,8 +289,16 @@ function startRound() {
       history: history
     });
 
+    // Обновляем балансы всех подключенных пользователей
     for (const [socketId, user] of socketUsers) {
-      io.to(socketId).emit('user_data', { ...user });
+      const freshUser = await prisma.user.findUnique({
+        where: { id: user.id }
+      });
+      if (freshUser) {
+        user.balance = freshUser.balance;
+        socketUsers.set(socketId, user);
+        io.to(socketId).emit('user_data', user);
+      }
     }
 
     engine.nextRound();
@@ -200,4 +312,10 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log('✅ Сервер запущен на порту ' + PORT);
   startRound();
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  await prisma.$disconnect();
+  process.exit();
 });
