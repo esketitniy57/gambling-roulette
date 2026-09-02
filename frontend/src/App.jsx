@@ -3,8 +3,9 @@ import { io } from 'socket.io-client';
 import Roulette from './components/Roulette.jsx';
 import BetPanel from './components/BetPanel.jsx';
 import PromoModal from './components/PromoModal.jsx';
+import History from './components/History.jsx';
 
-const socket = io('http://localhost:3000');
+const socket = io(window.location.hostname === 'localhost' ? 'http://localhost:3000' : window.location.origin.replace(/:\d+$/, ':3000'));
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -13,15 +14,14 @@ export default function App() {
   const [bets, setBets] = useState({ red: [], black: [], green: [] });
   const [status, setStatus] = useState('betting');
   const [winningColor, setWinningColor] = useState(null);
-  const [serverSeed, setServerSeed] = useState('');
+  const [history, setHistory] = useState([]);
   const [showPromo, setShowPromo] = useState(false);
 
   useEffect(() => {
-    // Имитация входа (позже заменим на Steam)
     const fakeUser = {
-      steamId: 'test123',
-      username: 'Player1',
-      avatar: 'https://via.placeholder.com/40',
+      steamId: 'test_' + Math.random().toString(36).substring(7),
+      username: 'Player_' + Math.floor(Math.random() * 1000),
+      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + Math.random(),
       balance: 500,
       usedDimasPromo: false
     };
@@ -33,6 +33,7 @@ export default function App() {
       setHash(data.hash);
       setBets(data.bets);
       setStatus(data.status);
+      setHistory(data.history || []);
     });
 
     socket.on('user_data', (data) => setUser(data));
@@ -43,7 +44,6 @@ export default function App() {
       setBets({ red: [], black: [], green: [] });
       setStatus('betting');
       setWinningColor(null);
-      setServerSeed('');
     });
 
     socket.on('new_bet', (data) => setBets(data.bets));
@@ -52,16 +52,16 @@ export default function App() {
     socket.on('round_end', (data) => {
       setStatus('finished');
       setWinningColor(data.winningColor);
-      setServerSeed(data.serverSeed);
+      setHistory(data.history || []);
     });
 
     socket.on('promo_success', (data) => {
-      alert('Промокод активирован! +1000 монет');
+      alert('✅ Промокод активирован! +1000 монет');
       setShowPromo(false);
     });
 
-    socket.on('promo_error', (msg) => alert('Ошибка: ' + msg));
-    socket.on('error_msg', (msg) => alert(msg));
+    socket.on('promo_error', (msg) => alert(' Ошибка: ' + msg));
+    socket.on('error_msg', (msg) => alert('⚠️ ' + msg));
 
     return () => socket.off();
   }, []);
@@ -75,21 +75,21 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen p-4">
-      <header className="flex justify-between items-center mb-6 bg-gray-800 p-4 rounded-lg">
-        <h1 className="text-2xl font-bold">🎰 ROULETTE</h1>
+    <div className="min-h-screen p-4 bg-gray-900">
+      <header className="flex justify-between items-center mb-6 bg-gray-800 p-4 rounded-lg shadow-lg">
+        <h1 className="text-2xl font-bold text-yellow-400">🎰 ROULETTE</h1>
         {user && (
           <div className="flex items-center gap-3">
-            <img src={user.avatar} className="w-10 h-10 rounded-full" />
+            <img src={user.avatar} className="w-10 h-10 rounded-full bg-gray-700" />
             <div>
-              <p className="font-bold">{user.username}</p>
-              <p className="text-yellow-400">💰 {user.balance}</p>
+              <p className="font-bold text-white">{user.username}</p>
+              <p className="text-yellow-400 font-bold">💰 {user.balance.toFixed(0)}</p>
             </div>
             <button
               onClick={() => setShowPromo(true)}
-              className="bg-purple-600 px-3 py-2 rounded hover:bg-purple-700"
+              className="bg-purple-600 px-3 py-2 rounded hover:bg-purple-700 text-white font-bold"
             >
-              🎁 Промокод
+               Промокод
             </button>
           </div>
         )}
@@ -97,16 +97,24 @@ export default function App() {
 
       <div className="text-center mb-4">
         <p className="text-sm text-gray-400">Раунд #{roundId}</p>
-        <p className="text-xs text-gray-500 break-all">Хеш: {hash}</p>
-        {serverSeed && (
-          <p className="text-xs text-green-400 break-all">Сид: {serverSeed}</p>
-        )}
-        <p className="mt-2">
-          Статус: <span className="font-bold">{status}</span>
-        </p>
+        <p className="text-xs text-gray-500 break-all px-2">Хеш: {hash}</p>
+        <div className="mt-2 inline-block px-4 py-1 rounded-full bg-gray-800">
+          <span className="text-gray-400">Статус: </span>
+          <span className={`font-bold ${
+            status === 'betting' ? 'text-green-400' : 
+            status === 'spinning' ? 'text-yellow-400' : 
+            'text-red-400'
+          }`}>
+            {status === 'betting' ? ' Приём ставок' : 
+             status === 'spinning' ? ' Крутится...' : 
+             ' Завершён'}
+          </span>
+        </div>
       </div>
 
       <Roulette winningColor={winningColor} status={status} />
+
+      <History history={history} />
 
       <BetPanel bets={bets} placeBet={placeBet} status={status} />
 
