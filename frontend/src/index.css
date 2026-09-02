@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  background: #0f172a;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+.roulette-wheel {
+  display: flex;
+  transition: transform 5s cubic-bezier(0.17, 0.67, 0.21, 0.99);
+}
+
+.roulette-sector {
+  width: 80px;
+  height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  border: 2px solid #1e293b;
+}
+
+.red { background: #dc2626; }
+.black { background: #1f2937; }
+.green { background: #16a34a; }
