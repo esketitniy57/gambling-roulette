@@ -16,7 +16,6 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Сессии
 app.use(session({
   secret: process.env.SESSION_SECRET || 'supersecretkey123',
   resave: false,
@@ -29,7 +28,6 @@ app.use(passport.session());
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((user, done) => done(null, user));
 
-// Steam авторизация
 passport.use(new SteamStrategy({
   returnURL: (process.env.SITE_URL || 'http://localhost:3000') + '/auth/steam/return',
   realm: (process.env.SITE_URL || 'http://localhost:3000') + '/',
@@ -55,25 +53,25 @@ app.get('/auth/steam/return',
 let currentRoundId = 1;
 let bets = { red: [], black: [], green: [] };
 let roundStatus = 'betting';
+let history = [];
 
-// Временное хранилище пользователей (пока нет БД)
-let users = {};
+// Хранилище пользователей
+const socketUsers = new Map();
+const allUsers = new Map();
 
-// Функция: получить или создать пользователя
 function getOrCreateUser(steamId, username, avatar) {
-  if (!users[steamId]) {
-    users[steamId] = {
+  if (!allUsers.has(steamId)) {
+    allUsers.set(steamId, {
       steamId,
       username,
       avatar,
-      balance: 0,
+      balance: 500,
       usedDimasPromo: false
-    };
+    });
   }
-  return users[steamId];
+  return allUsers.get(steamId);
 }
 
-// Вебсокеты
 io.on('connection', (socket) => {
   console.log('Подключился: ' + socket.id);
 
@@ -81,58 +79,68 @@ io.on('connection', (socket) => {
     roundId: currentRoundId,
     hash: engine.serverSeedHash,
     bets: bets,
-    status: roundStatus
+    status: roundStatus,
+    history: history
   });
 
-  // Авторизация через Steam (упрощённая для сокета)
   socket.on('login', (data) => {
     const user = getOrCreateUser(data.steamId, data.username, data.avatar);
-    socket.data.user = user;
-    socket.emit('user_data', user);
+    socketUsers.set(socket.id, user);
+    socket.emit('user_data', { ...user });
+    console.log('Вход пользователя: ' + user.username);
   });
 
-  // Ставка
   socket.on('place_bet', (data) => {
-    const user = socket.data.user;
+    const user = socketUsers.get(socket.id);
     if (!user) return socket.emit('error_msg', 'Сначала войди через Steam');
     if (roundStatus !== 'betting') return socket.emit('error_msg', 'Ставки закрыты');
 
     const { color, amount } = data;
     if (!['red', 'black', 'green'].includes(color)) return;
-    if (amount <= 0 || amount > user.balance) return socket.emit('error_msg', 'Недостаточно средств');
+    if (amount <= 0) return socket.emit('error_msg', 'Неверная сумма');
+    if (amount > user.balance) return socket.emit('error_msg', 'Недостаточно средств');
 
     user.balance -= amount;
     bets[color].push({
+      userId: user.steamId,
       username: user.username,
       avatar: user.avatar,
       amount: amount
     });
 
-    socket.emit('user_data', user);
+    socket.emit('user_data', { ...user });
     io.emit('new_bet', { color: color, bets: bets });
+    console.log('Ставка: ' + user.username + ' поставил ' + amount + ' на ' + color);
   });
 
-  // Промокод
   socket.on('activate_promo', (data) => {
-    const user = socket.data.user;
+    const user = socketUsers.get(socket.id);
     if (!user) return socket.emit('error_msg', 'Сначала войди через Steam');
+
+    console.log('Промокод от ' + user.username + ': ' + data.code);
 
     if (data.code.toLowerCase() !== 'dimas') {
       return socket.emit('promo_error', 'Неверный промокод');
     }
     if (user.usedDimasPromo) {
-      return socket.emit('promo_error', 'Уже использован');
+      return socket.emit('promo_error', 'Промокод уже использован');
     }
 
     user.balance += 1000;
     user.usedDimasPromo = true;
     socket.emit('promo_success', { newBalance: user.balance });
-    socket.emit('user_data', user);
+    socket.emit('user_data', { ...user });
+    console.log('Промокод активирован: ' + user.username);
+  });
+
+  socket.on('disconnect', () => {
+    socketUsers.delete(socket.id);
   });
 });
 
-// Игровой цикл
 function startRound() {
+  console.log('=== Начало раунда #' + currentRoundId + ' ===');
+  
   bets = { red: [], black: [], green: [] };
   roundStatus = 'betting';
 
@@ -141,43 +149,55 @@ function startRound() {
     hash: engine.serverSeedHash
   });
 
-  // 15 секунд на ставки
   setTimeout(() => {
+    console.log('Крутим рулетку...');
     roundStatus = 'spinning';
     io.emit('spinning');
 
     const clientSeed = Math.random().toString(36).substring(2);
     const result = engine.getRoundResult(engine.serverSeed, clientSeed, currentRoundId);
 
+    console.log('Выпало: ' + result.color + ' (число ' + result.roll + ')');
+
     const multipliers = { red: 2, black: 2, green: 14 };
     const winMultiplier = multipliers[result.color];
 
-    // Выплаты
     const winners = bets[result.color] || [];
     for (const bet of winners) {
-      for (const key in users) {
-        if (users[key].username === bet.username) {
-          users[key].balance += bet.amount * winMultiplier;
-        }
+      const user = allUsers.get(bet.userId);
+      if (user) {
+        user.balance += bet.amount * winMultiplier;
+        console.log('Выплата: ' + user.username + ' получил ' + (bet.amount * winMultiplier));
       }
     }
+
+    history.unshift({
+      roundId: currentRoundId,
+      color: result.color,
+      roll: result.roll
+    });
+    if (history.length > 20) history.pop();
 
     io.emit('round_end', {
       winningColor: result.color,
       roll: result.roll,
-      serverSeed: engine.serverSeed
+      serverSeed: engine.serverSeed,
+      history: history
     });
+
+    for (const [socketId, user] of socketUsers) {
+      io.to(socketId).emit('user_data', { ...user });
+    }
 
     engine.nextRound();
     currentRoundId++;
 
-    // Пауза 5 секунд и новый раунд
     setTimeout(startRound, 5000);
   }, 15000);
 }
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('Сервер запущен на порту ' + PORT);
+  console.log('✅ Сервер запущен на порту ' + PORT);
   startRound();
 });
