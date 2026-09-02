@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String   @id @default(uuid())
+  steamId        String   @unique
+  username       String
+  avatar         String
+  balance        Float    @default(0)
+  usedDimasPromo Boolean  @default(false)
+  bets           Bet[]
+  createdAt      DateTime @default(now())
+}
+
+model Round {
+  id             Int      @id @default(autoincrement())
+  serverSeedHash String
+  serverSeed     String
+  clientSeed     String
+  nonce          Int
+  winningColor   String
+  status         String   @default("betting")
+  bets           Bet[]
+  createdAt      DateTime @default(now())
+}
+
+model Bet {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  roundId   Int
+  round     Round    @relation(fields: [roundId], references: [id])
+  color     String
+  amount    Float
+  createdAt DateTime @default(now())
+}
